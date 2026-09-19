@@ -1,0 +1,9 @@
+src/
+src-backend/
+src-frontend/
+src-go/
+.gha.env
+.gha.out
+__pycache__/
+*.pyc
+.python-version

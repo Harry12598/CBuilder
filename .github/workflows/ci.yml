@@ -1,0 +1,169 @@
+# Public online builder. Mirrors shadowToyBuilder:
+# clone private sources with a PAT, then re-run each repo's docker-build.yml
+# via tools/run_wf.py (same GHCR login / tag / latest push).
+#
+# Required secrets — see README.md
+name: CI
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      ref_name:
+        description: 源仓库 tag 或 branch（如 v2.0.8 / main）
+        required: true
+        type: string
+      target:
+        description: 编译哪个镜像
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - backend
+          - frontend
+          - go
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prep
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          SRC_REPO_BACKEND: ${{ secrets.SRC_REPO_BACKEND }}
+          SRC_REPO_FRONT: ${{ secrets.SRC_REPO_FRONT }}
+          SRC_REPO_GO: ${{ secrets.SRC_REPO_GO }}
+          SRC_REF: ${{ secrets.SRC_REF }}
+          MASK: ${{ secrets.MASK }}
+          REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.ref_name || github.ref_name }}
+          TARGET_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.target || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MASK:-}" ]; then
+            printf '%s\n' "${MASK}" | while IFS= read -r w; do
+              [ -n "$w" ] && echo "::add-mask::$w"
+            done
+          fi
+
+          if [ -z "${SRC_REPO_BACKEND:-}" ] || [ -z "${SRC_REPO_FRONT:-}" ] || [ -z "${SRC_REPO_GO:-}" ]; then
+            echo "必须设置 SRC_REPO_BACKEND / FRONT / GO." >&2
+            exit 1
+          fi
+          BACKEND_REPO="$SRC_REPO_BACKEND"
+          FRONT_REPO="$SRC_REPO_FRONT"
+          GO_REPO="$SRC_REPO_GO"
+
+          TARGET="${TARGET_INPUT:-}"
+          if [ -z "$TARGET" ]; then
+            case "$REF_NAME" in
+              backend-*) TARGET=backend ;;
+              frontend-*) TARGET=frontend ;;
+              go-*|socket-*) TARGET=go ;;
+              all-*) TARGET=all ;;
+              *) TARGET=all ;;
+            esac
+          fi
+
+          echo "TARGET=$TARGET" >> "$GITHUB_ENV"
+          echo "REF_NAME=$REF_NAME" >> "$GITHUB_ENV"
+          echo "Building target=$TARGET ref=$REF_NAME"
+
+          clone_src() {
+            local repo="$1"
+            local dest="$2"
+            local ref="$3"
+            local auth="https://x-access-token:${GH_TOKEN}@github.com/${repo}.git"
+            local ver="$ref"
+            case "$ver" in
+              backend-*) ver="${ver#backend-}" ;;
+              frontend-*) ver="${ver#frontend-}" ;;
+              go-*) ver="${ver#go-}" ;;
+              socket-*) ver="${ver#socket-}" ;;
+              all-*) ver="${ver#all-}" ;;
+            esac
+
+            if git ls-remote --exit-code --tags "${auth}" "refs/tags/${ref}" >/dev/null 2>&1; then
+              git clone --depth 1 --branch "${ref}" "${auth}" "${dest}"
+              printf '%s' "$ref"
+            elif [ "$ver" != "$ref" ] && git ls-remote --exit-code --tags "${auth}" "refs/tags/${ver}" >/dev/null 2>&1; then
+              git clone --depth 1 --branch "${ver}" "${auth}" "${dest}"
+              printf '%s' "$ver"
+            elif git ls-remote --exit-code --heads "${auth}" "refs/heads/${ref}" >/dev/null 2>&1; then
+              git clone --depth 1 --branch "${ref}" "${auth}" "${dest}"
+              printf '%s' "$ref"
+            elif [ "$ver" != "$ref" ] && git ls-remote --exit-code --heads "${auth}" "refs/heads/${ver}" >/dev/null 2>&1; then
+              git clone --depth 1 --branch "${ver}" "${auth}" "${dest}"
+              printf '%s' "$ver"
+            elif [ -n "${SRC_REF:-}" ]; then
+              git clone --depth 1 --branch "${SRC_REF}" "${auth}" "${dest}"
+              printf '%s' "$SRC_REF"
+            else
+              git clone --depth 1 "${auth}" "${dest}"
+              printf '%s' "HEAD"
+            fi
+          }
+
+          if [ "$TARGET" = "all" ] || [ "$TARGET" = "backend" ]; then
+            checked="$(clone_src "$BACKEND_REPO" src-backend "$REF_NAME")"
+            echo "BACKEND_CHECKED=$checked" >> "$GITHUB_ENV"
+            echo "cloned backend@$checked from $BACKEND_REPO"
+          fi
+          if [ "$TARGET" = "all" ] || [ "$TARGET" = "frontend" ]; then
+            checked="$(clone_src "$FRONT_REPO" src-frontend "$REF_NAME")"
+            echo "FRONT_CHECKED=$checked" >> "$GITHUB_ENV"
+            echo "cloned frontend@$checked from $FRONT_REPO"
+          fi
+          if [ "$TARGET" = "all" ] || [ "$TARGET" = "go" ]; then
+            checked="$(clone_src "$GO_REPO" src-go "$REF_NAME")"
+            echo "GO_CHECKED=$checked" >> "$GITHUB_ENV"
+            echo "cloned go@$checked from $GO_REPO"
+          fi
+
+      - name: Exec
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          WF_PATH: ${{ secrets.WF_PATH }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install -q pyyaml
+
+          run_one() {
+            local src="$1"
+            local ref="$2"
+            export EVENT_REF="refs/tags/${ref}"
+            export EVENT_REF_NAME="${ref}"
+            export SRC_ROOT="${GITHUB_WORKSPACE}/${src}"
+            if [ -n "${WF_PATH:-}" ]; then
+              python3 tools/run_wf.py "${src}/${WF_PATH}"
+              return
+            fi
+            found=0
+            for f in "${src}/.github/workflows/"*.yml "${src}/.github/workflows/"*.yaml; do
+              [ -f "$f" ] || continue
+              python3 tools/run_wf.py "$f"
+              found=1
+            done
+            [ "$found" -eq 1 ]
+          }
+
+          if [ "${TARGET}" = "all" ] || [ "${TARGET}" = "backend" ]; then
+            run_one src-backend "${BACKEND_CHECKED:-$REF_NAME}"
+          fi
+          if [ "${TARGET}" = "all" ] || [ "${TARGET}" = "frontend" ]; then
+            run_one src-frontend "${FRONT_CHECKED:-$REF_NAME}"
+          fi
+          if [ "${TARGET}" = "all" ] || [ "${TARGET}" = "go" ]; then
+            run_one src-go "${GO_CHECKED:-$REF_NAME}"
+          fi
